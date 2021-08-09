@@ -726,22 +726,28 @@ handle_cast({store_fetched_chunk, Peer, Byte, RightBound, Proof, SubIntervals, L
 					Byte2 = Byte + ChunkSize,
 					Cast = {sync_chunk, [{Byte2, RightBound, Peer} | SubIntervals], Loop},
 					gen_server:cast(?MODULE, Cast),
-					store_fetched_chunk(
-						{
-							DataRoot,
-							AbsoluteTXStartOffset,
-							TXPath,
-							TXRoot,
-							TXSize,
-							DataPath,
-							Packing,
-							ChunkEndOffset,
-							ChunkSize,
-							Chunk,
-							UnpackedChunk
-						},
-						State
-					)
+					case ar_sync_record:is_recorded(Byte + 1, ?MODULE) of
+						{true, _} ->
+							%% The chunk has been synced by another job already.
+							{noreply, State};
+						false ->
+							store_fetched_chunk(
+								{
+									DataRoot,
+									AbsoluteTXStartOffset,
+									TXPath,
+									TXRoot,
+									TXSize,
+									DataPath,
+									Packing,
+									ChunkEndOffset,
+									ChunkSize,
+									Chunk,
+									UnpackedChunk
+								},
+								State
+							)
+					end
 			end
 	end;
 
@@ -1951,28 +1957,23 @@ update_chunks_index(Args, State) ->
 		ChunkSize,
 		Packing
 	} = Args,
-	case ar_sync_record:is_recorded(AbsoluteChunkOffset, Packing, ?MODULE) of
+	case ar_tx_blacklist:is_byte_blacklisted(AbsoluteChunkOffset) of
 		true ->
 			ok;
 		false ->
-			case ar_tx_blacklist:is_byte_blacklisted(AbsoluteChunkOffset) of
-				true ->
-					ok;
-				false ->
-					update_chunks_index2(
-						{
-							AbsoluteChunkOffset,
-							ChunkOffset,
-							ChunkDataKey,
-							TXRoot,
-							DataRoot,
-							TXPath,
-							ChunkSize,
-							Packing
-						},
-						State
-					)
-			end
+			update_chunks_index2(
+				{
+					AbsoluteChunkOffset,
+					ChunkOffset,
+					ChunkDataKey,
+					TXRoot,
+					DataRoot,
+					TXPath,
+					ChunkSize,
+					Packing
+				},
+				State
+			)
 	end.
 
 update_chunks_index2(Args, State) ->
@@ -1991,10 +1992,24 @@ update_chunks_index2(Args, State) ->
 	} = State,
 	Key = << AbsoluteOffset:?OFFSET_KEY_BITSIZE >>,
 	Value = {ChunkDataDBKey, TXRoot, DataRoot, TXPath, Offset, ChunkSize},
+	HasChunkInDiskPool =
+		case ar_kv:get(ChunksIndex, Key) of
+			{ok, PrevV} ->
+				{PrevChunkDataDBKey, _, _, _, _, _} = binary_to_term(PrevV),
+				{true, PrevChunkDataDBKey};
+			not_found ->
+				false
+		end,
 	case ar_kv:put(ChunksIndex, Key, term_to_binary(Value)) of
 		ok ->
 			StartOffset = AbsoluteOffset - ChunkSize,
 			ok = ar_sync_record:add(AbsoluteOffset, StartOffset, Packing, ?MODULE),
+			case HasChunkInDiskPool of
+				{true, PrevKey} ->
+					ok = delete_disk_pool_chunk(PrevKey, State);
+				false ->
+					ok
+			end,
 			ok;
 		{error, Reason} ->
 			?LOG_ERROR([
@@ -2255,32 +2270,42 @@ process_disk_pool_chunk_offset(
 	{Offset, _DataRootInDiskPool, ChunkSize, DataRoot, DataPathHash, ChunkDataKey, _Key} = Args,
 	case AbsoluteOffset > DiskPoolThreshold of
 		true ->
-			case update_chunks_index(
-					{
-						AbsoluteOffset,
-						Offset,
-						ChunkDataKey,
-						TXRoot,
-						DataRoot,
-						TXPath,
-						ChunkSize,
-						unpacked
-					},
-					State
-			) of
-				ok ->
+			case ar_sync_record:is_recorded(AbsoluteOffset, ?MODULE) of
+				{true, _} ->
 					process_disk_pool_chunk_offsets(
 						Iterator,
 						max(LatestOffset, AbsoluteOffset),
 						Args,
 						State
 					);
-				{error, Reason} ->
-					?LOG_ERROR([
-						{event, failed_to_update_chunks_index},
-						{reason, io_lib:format("~p", [Reason])}
-					]),
-					{noreply, State}
+				false ->
+					case update_chunks_index(
+							{
+								AbsoluteOffset,
+								Offset,
+								ChunkDataKey,
+								TXRoot,
+								DataRoot,
+								TXPath,
+								ChunkSize,
+								unpacked
+							},
+							State
+					) of
+						ok ->
+							process_disk_pool_chunk_offsets(
+								Iterator,
+								max(LatestOffset, AbsoluteOffset),
+								Args,
+								State
+							);
+						{error, Reason} ->
+							?LOG_ERROR([
+								{event, failed_to_update_chunks_index},
+								{reason, io_lib:format("~p", [Reason])}
+							]),
+							{noreply, State}
+					end
 			end;
 		false ->
 			case ar_sync_record:is_recorded(AbsoluteOffset, aes_256_cbc, ?MODULE) of
